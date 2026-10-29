@@ -1,0 +1,1 @@
+Feed works. Data as of 16:14 ET, SPY ~760.55, 761 call bid 0.17 / ask 0.18.
