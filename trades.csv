@@ -1,0 +1,2 @@
+date,strike,contracts,entry_time,entry_ask,entry_bid,exit_time,exit_price,exit_reason,result,balance
+2026-10-30,761.0,2,10:00,1.77,1.76,12:01,0.33,stop,-288.08,1711.92
