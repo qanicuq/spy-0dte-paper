@@ -1,22 +1,24 @@
 """Paper trades Version B: buy the nearest-to-the-money SPY 0DTE call at 10:00 AM ET,
 sell all at +25% or stop out at -80%, otherwise sell at 3:55 PM. Paper money only.
 
-Prices come from Cboe's free delayed quotes (every SPY option's bid and ask).
+Prices are live quotes from the user's tastytrade account (read-only sign-in: it can never trade).
 Fills: buy at the ask; target is a limit sell that fills when the bid reaches it;
 stop and 3:55 exits sell at the bid. Whole contracts only.
 """
-import csv, json, math, os, sys, time, urllib.request
+import csv, json, math, os, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
-URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/SPY.json"
+TT_API = "https://api.tastyworks.com"
 START_BALANCE, STAKE, FEE = 2000.0, 500.0, 0.02   # FEE is per contract, each side
 TARGET, STOP = 1.25, 0.20
+MAX_FAILS = 10                                     # quote failures in a row (about 5 minutes) before giving up
 EARLY_CLOSE = {"2026-11-27", "2026-12-24"}         # exit at 12:55 PM on these days
 TRADES, STATE = "trades.csv", "open_trade.json"
 FIELDS = ["date", "strike", "contracts", "entry_time", "entry_ask", "entry_bid",
           "exit_time", "exit_price", "exit_reason", "result", "balance"]
+_token, _token_at = None, 0.0
 
 
 def notify(title, msg):
@@ -27,31 +29,50 @@ def notify(title, msg):
     urllib.request.urlopen(req, timeout=20)
 
 
-def snapshot():
-    """Return (as_of ET datetime, underlying price, {strike: (bid, ask)}) for today's calls."""
-    req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
-    data = json.load(urllib.request.urlopen(req, timeout=60))["data"]
-    today = datetime.now(ET).strftime("%y%m%d")
-    calls, puts, last = {}, {}, None
-    for o in data["options"]:
-        sym = o["option"]
-        if sym[3:9] != today:
-            continue
-        k = int(sym[10:]) / 1000
-        quote = (float(o["bid"] or 0), float(o["ask"] or 0))
-        (calls if sym[9] == "C" else puts)[k] = quote
-        t = o.get("last_trade_time")
-        if t and t[:10] == datetime.now(ET).strftime("%Y-%m-%d"):
-            last = max(last, t) if last else t
-    if not calls or last is None:
-        return None, None, {}
-    as_of = datetime.fromisoformat(last).replace(tzinfo=ET)   # newest trade = how current the data is
-    # SPY price from put-call parity at the strike where call and put are closest
-    both = [k for k in calls if k in puts and min(calls[k] + puts[k]) > 0]
-    mid = lambda q: (q[0] + q[1]) / 2
-    k0 = min(both, key=lambda k: abs(mid(calls[k]) - mid(puts[k])))
-    spy = k0 + mid(calls[k0]) - mid(puts[k0])
-    return as_of, spy, calls
+def quote(params):
+    """(bid, ask, last) for one symbol from tastytrade, or None if tastytrade has no quote for it."""
+    global _token, _token_at
+    head = {"User-Agent": "spy-0dte-paper/1.0", "Content-Type": "application/json"}
+    if _token is None or time.time() - _token_at > 600:   # access tokens last 15 minutes; renew after 10
+        body = json.dumps({"grant_type": "refresh_token", "refresh_token": os.environ["TT_REFRESH_TOKEN"],
+                           "client_id": os.environ["TT_CLIENT_ID"], "client_secret": os.environ["TT_CLIENT_SECRET"],
+                           "scope": "read"}).encode()   # read only: can never trade
+        req = urllib.request.Request(TT_API + "/oauth/token", data=body, headers=head)
+        _token, _token_at = json.load(urllib.request.urlopen(req, timeout=20))["access_token"], time.time()
+    req = urllib.request.Request(TT_API + "/market-data/by-type?" + urllib.parse.urlencode(params),
+                                 headers={**head, "Authorization": "Bearer " + _token})
+    try:
+        items = json.load(urllib.request.urlopen(req, timeout=20)).get("data", {}).get("items", [])
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):   # unknown symbol, e.g. no option expiring today
+            return None
+        raise
+    if not items:
+        return None
+    r = items[0]
+    return float(r.get("bid") or 0), float(r.get("ask") or 0), float(r.get("last") or 0)
+
+
+def snapshot(strikes=None):
+    """Return (as_of ET datetime, SPY price, {strike: (bid, ask)}) for SPY calls expiring today.
+    strikes=None looks at the 7 whole-dollar strikes nearest SPY. as_of is None when no
+    SPY option expiring today has a quote (market closed)."""
+    s = quote({"equity": "SPY"})
+    if s is None:
+        raise RuntimeError("tastytrade sent no SPY quote")
+    bid, ask, last = s
+    spy = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+    if strikes is None:
+        strikes = range(round(spy) - 3, round(spy) + 4)
+    day = datetime.now(ET).strftime("%y%m%d")
+    calls = {}
+    for k in strikes:
+        q = quote({"equity-option": f"SPY   {day}C{round(float(k) * 1000):08d}"})   # OCC symbol
+        if q:
+            calls[float(k)] = q[:2]
+    if not calls:
+        return None, spy, {}
+    return datetime.now(ET), spy, calls
 
 
 def load_trades():
@@ -104,11 +125,20 @@ def main(test=False, check=False):
     if started >= deadline:   # started after the trading day (e.g. a manual test run)
         print("Trading day is over; nothing to do."); return
 
+    fails = 0
     while datetime.now(ET) < deadline:
         try:
-            as_of, spy, calls = snapshot()
+            as_of, spy, calls = snapshot([trade["strike"]] if trade else None)
+            fails = 0
         except Exception as e:
-            print("fetch failed:", e); time.sleep(30); continue
+            fails += 1
+            print(f"fetch failed ({fails} in a row):", e)
+            if fails >= MAX_FAILS:
+                notify("SPY 0DTE bot: problem",
+                       f"{today}: tastytrade quotes failed {fails} times in a row ({e}). "
+                       + ("A paper trade is still open. " if trade else "") + "Stopped; check the run.")
+                sys.exit(1)
+            time.sleep(30); continue
         now = datetime.now(ET)
         if as_of is None:
             if now.hour * 60 + now.minute > 10 * 60 + 45:
