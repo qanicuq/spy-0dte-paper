@@ -1,7 +1,7 @@
 name: SPY 0DTE paper trade
 
 on:
-  workflow_dispatch:          # cron-job.org starts this at 10:10 AM ET on weekdays
+  workflow_dispatch:          # cron-job.org starts this at 9:55 AM ET on weekdays
     inputs:
       mode:
         description: "run = trade today, test = check the data feed and send a test alert"
@@ -35,6 +35,10 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           GH_TOKEN: ${{ github.token }}
+          # Live SPY quotes from tastytrade, read-only sign-in (user, 2026-11-26)
+          TT_CLIENT_ID: ${{ secrets.TT_CLIENT_ID }}
+          TT_CLIENT_SECRET: ${{ secrets.TT_CLIENT_SECRET }}
+          TT_REFRESH_TOKEN: ${{ secrets.TT_REFRESH_TOKEN }}
           MODE: ${{ github.event_name == 'schedule' && 'check' || inputs.mode }}
         run: python bot.py --$MODE
 
@@ -45,10 +49,10 @@ jobs:
           git commit -qm "Paper trade log" && git push -q || echo "Nothing new to save"
 
       - name: Alert on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          curl -s -H "Title: SPY 0DTE bot failed" \
-            -d "A run failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          curl -s -H "Title: SPY 0DTE bot failed or was stopped" \
+            -d "A run failed or was stopped: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
